@@ -19,8 +19,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-DMA_ATTR uint8_t      dma_buff[128];
-DMA_ATTR lldesc_t     dma_descriptor;
 
 void print_buff( void *p_buffer, uint16_t buffer_size );
 
@@ -42,6 +40,22 @@ static const gpio_num_t data_bus_pins[DATA_BUS_WIDTH + 2] =
 #define SERIAL_WORD_BIT_LENGTH    ( 16 )
 #define PARALLEL_WORD_BYTE_LENGTH ( ( ( DATA_BUS_WIDTH  - 1 ) / 8 ) + 1 )   // Number of bytes needed to store a single parallel word
 
+#define TOTAL_BYTES_PER_SAMPLE	  ( PARALLEL_WORD_BYTE_LENGTH * SERIAL_WORD_BIT_LENGTH )
+#define SAMPLES_PER_DMA			  ( 8 )
+#define NUM_CHAINED_DMAS		  ( 2 )
+
+DMA_ATTR uint8_t      dma_buff[NUM_CHAINED_DMAS][SAMPLES_PER_DMA * TOTAL_BYTES_PER_SAMPLE];
+DMA_ATTR lldesc_t     dma_descriptor[NUM_CHAINED_DMAS];
+
+static uint16_t		  isr_cnt = 0;
+
+static void IRAM_ATTR i2s_isr(void* arg);
+static intr_handle_t i2s_intr_handle;
+
+uint32_t ptrs[10] = { 0 };
+uint8_t ptrs_cnt = 0;
+
+//-----------------------------------------------------------------------------
 void app_main()
 {
   ledc_timer_config_t ledc_timer_bclk =
@@ -135,7 +149,7 @@ void app_main()
   I2S0.conf2.camera_en = 1;                   // Use HSYNC/VSYNC/HREF to control sampling
   I2S0.clkm_conf.clk_sel = 2;                 // 0: No clock  1: APLL_CLK   2: PLL_160M_CLK  3: No clock
   I2S0.clkm_conf.clk_en = 1;                  // Enable clock gate
-  // In I2S slave mode, IS20 freq >= 8 * f_bclk.
+											  // In I2S slave mode, IS20 freq >= 8 * f_bclk.
 
   // Configure clock divider
   I2S0.clkm_conf.clkm_div_a = 1;              // Fractional clock divider denominator value
@@ -154,50 +168,60 @@ void app_main()
   I2S0.conf_chan.rx_chan_mod = 0;                    // I2S receiver channel mode configuration bits, not used when rx_dma_equal = 0
 
   // Clear flags which are used in I2S serial mode
-  I2S0.sample_rate_conf.rx_bits_mod = PARALLEL_WORD_BYTE_LENGTH *
-                                      8;  // Bit length of I2S receiver channel (word width, must be multiple of 8)
-  // Value of 0 = 32-bit.  When = 8, LSB = I2S0I_DATA_IN8_IDX, else LSB = I2S0I_DATA_IN0_IDX
+  I2S0.sample_rate_conf.rx_bits_mod = PARALLEL_WORD_BYTE_LENGTH * 8;  // Bit length of I2S receiver channel (word width, must be multiple of 8)
+																	  // Value of 0 = 32-bit.  When = 8, LSB = I2S0I_DATA_IN8_IDX, else LSB = I2S0I_DATA_IN0_IDX
   I2S0.conf.rx_right_first = 0;                     // Receive right channel data first
   I2S0.conf.rx_msb_right = 0;                       // Place right channel data at the MSB in the receive FIFO
   I2S0.conf.rx_msb_shift = 0;                       // Enable receiver in Phillips standard mode
   I2S0.conf.rx_mono = 0;                            // Enable receiver in mono mode
   I2S0.conf.rx_short_sync = 0;                      // Enable receiver in PCM standard mode
   I2S0.conf.rx_dma_equal = 0;
-  //I2S0.conf.rx_big_endian = 1;
   I2S0.timing.val = 0;                              // Clear all the bits in I2S0.timing.* union
 
-  memset( dma_buff, 0x5A, sizeof( dma_buff ) );
-  printf( "In Buffer:" );
-  print_buff( dma_buff, 10 );
-
-  dma_descriptor.length = 0;                            // Number of byte written to the buffer
-  dma_descriptor.size = sizeof( dma_buff );           // In bytes, must be in whole number of words
-  dma_descriptor.owner = 1;                             // The allowed operator is the DMA controller
-  dma_descriptor.sosf = 0;                              // Start of sub-frame. Also likely not used with I2S
-  dma_descriptor.buf = ( uint8_t * )dma_buff;
-  dma_descriptor.offset = 0;
-  dma_descriptor.empty = 0;
-  dma_descriptor.eof = 1;                            // indicates the end of the linked list
-  dma_descriptor.qe.stqe_next = NULL;                // pointer to the next descriptor
-
-  uint16_t number_samples = 2;
-  I2S0.rx_eof_num = number_samples * PARALLEL_WORD_BYTE_LENGTH * SERIAL_WORD_BIT_LENGTH;     // The length of data to be received
-  I2S0.in_link.addr = ( uint32_t )&dma_descriptor;
+  for ( uint8_t idx = 0; idx < NUM_CHAINED_DMAS; idx++ )
+  {
+	  dma_descriptor[idx].length = 0;                            // Number of byte written to the buffer
+	  dma_descriptor[idx].size = sizeof( dma_buff[idx] );           // In bytes, must be in whole number of words
+	  dma_descriptor[idx].owner = 1;                             // The allowed operator is the DMA controller
+	  dma_descriptor[idx].sosf = 0;                              // Start of sub-frame. Also likely not used with I2S
+	  dma_descriptor[idx].buf = ( uint8_t * )dma_buff[idx];
+	  dma_descriptor[idx].offset = 0;
+	  dma_descriptor[idx].empty = 0;
+	  dma_descriptor[idx].eof = 0; 								                 // indicates the end of the linked list
+	  dma_descriptor[idx].qe.stqe_next = &dma_descriptor[ ( idx + 1 ) % NUM_CHAINED_DMAS ];       // pointer to the next descriptor	  
+  }
+  
+  I2S0.rx_eof_num = SAMPLES_PER_DMA * PARALLEL_WORD_BYTE_LENGTH * SERIAL_WORD_BIT_LENGTH;     // The length of data to be received
+  I2S0.in_link.addr = ( uint32_t )&dma_descriptor[0];
   I2S0.in_link.start = 1;                            // Start the inlink descriptor
-  I2S0.int_clr.val = I2S0.int_raw.val;               // Clear interrupt flags
   I2S0.int_ena.val = 0;                              // Disable all interrupts
+  I2S0.int_clr.val = I2S0.int_raw.val;               // Clear interrupt flags
+  I2S0.int_ena.in_suc_eof = 1;                          // Trigger interrupt when current descriptor is handled
+
+  esp_intr_alloc(ETS_I2S0_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM, i2s_isr, (void*)&I2S0, &i2s_intr_handle);
+  esp_intr_enable(i2s_intr_handle);
 
   I2S0.conf.rx_start = 1;                            // Start I2S & the DMA
   vTaskDelay( 250 / portTICK_RATE_MS );
   I2S0.conf.rx_start = 0;                            // Stop I2S & the DMA
+  
+  printf( "ISR Cnt: %i\n", isr_cnt );
 
-  printf( "Out Buffer:" );
-  print_buff( dma_buff, I2S0.rx_eof_num );
+  printf("Ref 0 0x%x\n", (uint32_t)&dma_descriptor[0]);
+  printf("Ref 1 0x%x\n", (uint32_t)&dma_descriptor[1]);
+
+  
+  for ( uint8_t idx = 0; idx < 10; idx++ )
+  {
+	  printf("%i 0x%x\n", idx, ptrs[idx] );
+  }
+  
+  return;
 
   // Turn parallel data into serial data (inefficient/computationally intensive. Should be optimized, maybe with a lookup table):
-  uint8_t  *parallel_data_ptr = dma_buff;
+  uint8_t  *parallel_data_ptr = dma_buff[0];
 
-  for ( uint8_t sample_idx = 0; sample_idx < number_samples; sample_idx++ )
+  for ( uint8_t sample_idx = 0; sample_idx < ( SAMPLES_PER_DMA * NUM_CHAINED_DMAS ); sample_idx++ )
   {
     uint32_t serial_data[DATA_BUS_WIDTH] = { 0 };
 
@@ -221,6 +245,19 @@ void app_main()
               serial_data[data_bus_idx] );
     }
   }
+}
+
+//-----------------------------------------------------------------------------
+static void IRAM_ATTR i2s_isr(void* arg)
+{
+	I2S0.int_clr.val = I2S0.int_raw.val;
+    isr_cnt++;
+	
+	if ( ptrs_cnt < 10 )
+	{
+		ptrs[ptrs_cnt] = (uint32_t)I2S0.in_eof_des_addr;
+		ptrs_cnt++;
+	}
 }
 
 //-----------------------------------------------------------------------------
